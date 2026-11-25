@@ -13,6 +13,8 @@ _KEY_PREFIX = "tk1"
 _FIELD_SEP = ";"
 _SCOPE_SEP = ","
 _ALL_SCOPE = "*"
+# now 以秒计、ttl 以毫秒计，写入过期时间时必须除以 1000。
+_MILLISECONDS_PER_SECOND = 1000.0
 
 
 def _text(value):
@@ -90,23 +92,38 @@ def _current_version(store, subject):
 
 
 def normalize_scopes(scopes):
-    """把权限集合归一为元组形式。"""
-    items = []
-    for raw in scopes or ():
+    """把权限集合归一为有序、去重的元组形式。
+
+    归一结果与书写顺序、重复次数无关；空集合保持为空元组，
+    通配权限 ``*`` 原样保留，因此空权限与全部权限是两种不同情形。
+    也接受用权限分隔符拼成的文本（如 ``"read,write"``）。
+    """
+    if scopes is None:
+        raw_items = ()
+    elif isinstance(scopes, str):
+        raw_items = _split_scopes(scopes)
+    else:
+        raw_items = scopes
+    items = set()
+    for raw in raw_items or ():
         token = _text(raw)
-        if not token or token == _ALL_SCOPE:
+        if not token:
             continue
-        items.append(token)
-    if not items:
-        return (_ALL_SCOPE,)
-    return tuple(items)
+        items.add(token)
+    return tuple(sorted(items))
 
 
 def cache_key(subject, audience, scopes, version):
-    """由请求的各个维度构造缓存键。"""
+    """由请求的各个维度构造缓存键。
+
+    键必须同时包含主体、受众、归一后的完整权限集合以及版本，
+    缺任何一个维度都会造成不同条目共用缓存。
+    """
     descriptor = {
         "subject": _text(subject),
+        "audience": _text(audience),
         "scope": _SCOPE_SEP.join(normalize_scopes(scopes)),
+        "version": str(_as_int(version, 0)),
     }
     parts = [_KEY_PREFIX]
     for name in sorted(descriptor):
@@ -127,7 +144,8 @@ def put(store, key, value, now, ttl):
         "version": info["version"],
         "value": value,
         "created": created,
-        "expires": created + float(ttl),
+        # ttl 是毫秒，now/expires 是秒，必须先换算，不能直接相加。
+        "expires": created + float(ttl) / _MILLISECONDS_PER_SECOND,
         "ttl": float(ttl),
     }
     store[key] = entry
@@ -135,38 +153,75 @@ def put(store, key, value, now, ttl):
 
 
 def get(store, key, now):
-    """读取缓存条目，未命中返回 None。"""
+    """读取缓存条目，未命中返回 None。
+
+    以下情形都视为未命中：键下没有条目、条目不是字典、已经过期、
+    键中版本与条目版本不符，或者该主体在存储中已经出现更高版本
+    （权限/版本前进后留下的旧条目必须立即不再对外提供）。
+    """
     entry = store.get(key)
-    if entry is None:
+    if not isinstance(entry, dict):
         return None
     if _is_expired(entry, now):
+        return None
+    info = _parse_key(key)
+    entry_version = _as_int(entry.get("version"), info["version"])
+    if info["has_version"] and info["version"] != entry_version:
+        return None
+    subject = entry.get("subject", info["subject"])
+    if entry_version < _current_version(store, subject):
         return None
     return dict(entry)
 
 
 def invalidate_subject(store, subject):
-    """按主体失效全部条目，返回删除的条目数。"""
+    """按主体失效其全部条目，返回实际删除的条目数。"""
     target = _text(subject)
     removed = 0
     for key in list(store.keys()):
-        entry = store.get(key) or {}
-        if entry.get("subject") != target:
+        entry = store.get(key)
+        if isinstance(entry, dict):
+            raw_subject = entry.get("subject")
+            if raw_subject is None:
+                raw_subject = _parse_key(key)["subject"]
+        else:
+            raw_subject = _parse_key(key)["subject"]
+        if _text(raw_subject) != target:
             continue
         store.pop(key, None)
         removed += 1
-        break
     return removed
 
 
+def _entry_scope_tuple(entry, key=""):
+    """取条目的权限集合，并归一为有序去重元组。"""
+    raw_scopes = None
+    if isinstance(entry, dict):
+        raw_scopes = entry.get("scopes")
+        if raw_scopes is None:
+            raw_scopes = entry.get("scope_text")
+    if raw_scopes is None:
+        raw_scopes = _parse_key(key)["scope_text"]
+    return normalize_scopes(raw_scopes)
+
+
 def invalidate_scope(store, scope):
-    """按权限失效相关条目，返回删除的条目数。"""
-    target = _text(scope)
+    """按权限集合失效条目，返回实际删除的条目数。
+
+    只删除权限集合归一后与目标完全相同的条目：顺序、重复写法不影响
+    比较，但多一个或少一个权限都不算匹配，也不做子串/包含匹配。
+    目标可以是权限序列，也可以是单个权限或逗号拼接的权限文本。
+    """
+    target = normalize_scopes(scope)
     removed = 0
     for key in list(store.keys()):
-        entry = store.get(key) or {}
-        if target and target in str(entry.get("scope_text", "")):
-            store.pop(key, None)
-            removed += 1
+        entry = store.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if _entry_scope_tuple(entry, key) != target:
+            continue
+        store.pop(key, None)
+        removed += 1
     return removed
 
 
@@ -199,11 +254,14 @@ def validate_store(store):
 
 
 def cache_batch(requests):
-    """批量写入并读回，返回各请求的键与查询结果。"""
+    """批量写入并读回，返回各请求各自的键与查询结果。
+
+    逐条独立处理：每个请求只写入并按自己的键读回，不能复用上一条
+    请求的键，避免相邻请求串结果。
+    """
     store = {}
     keys = []
     results = []
-    cursor = None
     for request in requests or ():
         item = request or {}
         key = cache_key(
@@ -214,8 +272,6 @@ def cache_batch(requests):
         )
         now = item.get("now", 0.0)
         put(store, key, item.get("value"), now, item.get("ttl", 0))
-        lookup = cursor or key
-        results.append(get(store, lookup, now))
+        results.append(get(store, key, now))
         keys.append(key)
-        cursor = key
     return {"keys": keys, "results": results}
